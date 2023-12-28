@@ -33,7 +33,7 @@ use utoipa_swagger_ui::SwaggerUi;
 #[utoipa::path(
 get,
 tag = "Text Embeddings Inference",
-path = "/info",
+path = "/meta",
 responses((status = 200, description = "Served model info", body = Info))
 )]
 #[instrument]
@@ -44,23 +44,23 @@ async fn get_model_info(info: Extension<Info>) -> Json<Info> {
 #[utoipa::path(
 get,
 tag = "Text Embeddings Inference",
-path = "/health",
-responses(
-(status = 200, description = "Everything is working fine"),
-(status = 503, description = "Text embeddings Inference is down", body = ErrorResponse,
-example = json ! ({"error": "unhealthy", "error_type": "unhealthy"})),
-)
+path = "/.well-known/live",
+responses((status = 204, description = "Everything is working fine"))
 )]
 #[instrument(skip(infer))]
-/// Health check method
-async fn health(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    match infer.health().await {
-        true => Ok(()),
-        false => Err(ErrorResponse {
-            error: "unhealthy".to_string(),
-            error_type: ErrorType::Unhealthy,
-        })?,
-    }
+async fn live(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    Ok(())
+}
+
+#[utoipa::path(
+get,
+tag = "Text Embeddings Inference",
+path = "/.well-known/ready",
+responses((status = 204, description = "Everything is working fine"))
+)]
+#[instrument(skip(infer))]
+async fn ready(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    Ok(())
 }
 
 /// Get Predictions. Returns a 424 status code if the model is not a Sequence Classification model
@@ -425,7 +425,7 @@ async fn rerank(
 #[utoipa::path(
 post,
 tag = "Text Embeddings Inference",
-path = "/embed",
+path = "/vectors",
 request_body = EmbedRequest,
 responses(
 (status = 200, description = "Embeddings", body = EmbedResponse),
@@ -451,15 +451,15 @@ async fn embed(
     let span = tracing::Span::current();
     let start_time = Instant::now();
 
-    let (response, metadata) = match req.inputs {
-        Input::Single(input) => {
+    let (response, metadata) = match req.text {
+        Input::Single(text) => {
             metrics::increment_counter!("te_request_count", "method" => "single");
 
-            let compute_chars = input.chars().count();
+            let compute_chars = text.chars().count();
 
             let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
             let response = infer
-                .embed(input, req.truncate, req.normalize, permit)
+                .embed(text, req.truncate, req.normalize, permit)
                 .await
                 .map_err(ErrorResponse::from)?;
 
@@ -477,10 +477,10 @@ async fn embed(
                 ),
             )
         }
-        Input::Batch(inputs) => {
+        Input::Batch(text) => {
             metrics::increment_counter!("te_request_count", "method" => "batch");
 
-            let batch_size = inputs.len();
+            let batch_size = text.len();
             if batch_size > info.max_client_batch_size {
                 let message = format!(
                     "batch size {batch_size} > maximum allowed batch size {}",
@@ -498,14 +498,14 @@ async fn embed(
             let mut futures = Vec::with_capacity(batch_size);
             let mut compute_chars = 0;
 
-            for input in inputs {
-                compute_chars += input.chars().count();
+            for txt in text {
+                compute_chars += txt.chars().count();
 
                 let local_infer = infer.clone();
                 futures.push(async move {
                     let permit = local_infer.acquire_permit().await;
                     local_infer
-                        .embed(input, req.truncate, req.normalize, permit)
+                        .embed(txt, req.truncate, req.normalize, permit)
                         .await
                 })
             }
@@ -801,14 +801,16 @@ pub async fn run(
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()))
         // Base routes
-        .route("/info", get(get_model_info))
-        .route("/embed", post(embed))
+        .route("/meta", get(get_model_info))
+        .route("/vectors", post(embed))
+        .route("/vectors/", post(embed)) 
         .route("/predict", post(predict))
         .route("/rerank", post(rerank))
         // OpenAI compat route
         .route("/embeddings", post(openai_embed))
         // Base Health route
-        .route("/health", get(health))
+        .route("/.well-known/live", get(live))
+        .route("/.well-known/ready", get(ready))
         // Inference API health route
         .route("/", get(health))
         // AWS Sagemaker health route

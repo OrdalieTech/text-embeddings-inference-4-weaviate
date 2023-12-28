@@ -12,7 +12,7 @@
     "version": "0.6.0"
   },
   "paths": {
-    "/embed": {
+    "/vectors": {
       "post": {
         "tags": [
           "Text Embeddings Inference"
@@ -217,7 +217,7 @@
         }
       }
     },
-    "/info": {
+    "/meta": {
       "get": {
         "tags": [
           "Text Embeddings Inference"

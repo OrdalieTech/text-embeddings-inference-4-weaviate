@@ -1,6 +1,6 @@
 <div align="center">
 
-# Text Embeddings Inference
+# Text Embeddings Inference (Weaviate compatible)
 
 <a href="https://github.com/huggingface/text-embeddings-inference">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/huggingface/text-embeddings-inference?style=social">
