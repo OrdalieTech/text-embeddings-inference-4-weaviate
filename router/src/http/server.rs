@@ -1,6 +1,6 @@
 /// HTTP Server logic
 use crate::http::types::{
-    EmbedRequest, EmbedResponse, Input, OpenAICompatEmbedding, OpenAICompatErrorResponse,
+    EmbedRequest, EmbedResponse, EmbedWeaviateRequest, EmbedWeaviateResponse, Input, OpenAICompatEmbedding, OpenAICompatErrorResponse,
     OpenAICompatRequest, OpenAICompatResponse, OpenAICompatUsage, PredictInput, PredictRequest,
     PredictResponse, Prediction, Rank, RerankRequest, RerankResponse, Sequence,
 };
@@ -61,6 +61,28 @@ responses((status = 204, description = "Everything is working fine"))
 #[instrument(skip(infer))]
 async fn ready(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     Ok(())
+}
+
+#[utoipa::path(
+get,
+tag = "Text Embeddings Inference",
+path = "/health",
+responses(
+(status = 200, description = "Everything is working fine"),
+(status = 503, description = "Text embeddings Inference is down", body = ErrorResponse,
+example = json ! ({"error": "unhealthy", "error_type": "unhealthy"})),
+)
+)]
+#[instrument(skip(infer))]
+/// Health check method
+async fn health(infer: Extension<Infer>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match infer.health().await {
+        true => Ok(()),
+        false => Err(ErrorResponse {
+            error: "unhealthy".to_string(),
+            error_type: ErrorType::Unhealthy,
+        })?,
+    }
 }
 
 /// Get Predictions. Returns a 424 status code if the model is not a Sequence Classification model
@@ -423,6 +445,141 @@ async fn rerank(
 
 /// Get Embeddings. Returns a 424 status code if the model is not an embedding model.
 #[utoipa::path(
+    post,
+    tag = "Text Embeddings Inference",
+    path = "/embed",
+    request_body = EmbedRequest,
+    responses(
+    (status = 200, description = "Embeddings", body = EmbedResponse),
+    (status = 424, description = "Embedding Error", body = ErrorResponse,
+    example = json ! ({"error": "Inference failed", "error_type": "backend"})),
+    (status = 429, description = "Model is overloaded", body = ErrorResponse,
+    example = json ! ({"error": "Model is overloaded", "error_type": "overloaded"})),
+    (status = 422, description = "Tokenization error", body = ErrorResponse,
+    example = json ! ({"error": "Tokenization error", "error_type": "tokenizer"})),
+    (status = 413, description = "Batch size error", body = ErrorResponse,
+    example = json ! ({"error": "Batch size error", "error_type": "validation"})),
+    )
+    )]
+    #[instrument(
+        skip_all,
+        fields(total_time, tokenization_time, queue_time, inference_time,)
+    )]
+    async fn embed(
+        infer: Extension<Infer>,
+        info: Extension<Info>,
+        Json(req): Json<EmbedRequest>,
+    ) -> Result<(HeaderMap, Json<EmbedResponse>), (StatusCode, Json<ErrorResponse>)> {
+        let span = tracing::Span::current();
+        let start_time = Instant::now();
+    
+        let (response, metadata) = match req.inputs {
+            Input::Single(input) => {
+                metrics::increment_counter!("te_request_count", "method" => "single");
+    
+                let compute_chars = input.chars().count();
+    
+                let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
+                let response = infer
+                    .embed(input, req.truncate, req.normalize, permit)
+                    .await
+                    .map_err(ErrorResponse::from)?;
+    
+                metrics::increment_counter!("te_request_success", "method" => "single");
+    
+                (
+                    EmbedResponse(vec![response.results]),
+                    ResponseMetadata::new(
+                        compute_chars,
+                        response.prompt_tokens,
+                        start_time,
+                        response.tokenization,
+                        response.queue,
+                        response.inference,
+                    ),
+                )
+            }
+            Input::Batch(inputs) => {
+                metrics::increment_counter!("te_request_count", "method" => "batch");
+    
+                let batch_size = inputs.len();
+                if batch_size > info.max_client_batch_size {
+                    let message = format!(
+                        "batch size {batch_size} > maximum allowed batch size {}",
+                        info.max_client_batch_size
+                    );
+                    tracing::error!("{message}");
+                    let err = ErrorResponse {
+                        error: message,
+                        error_type: ErrorType::Validation,
+                    };
+                    metrics::increment_counter!("te_request_failure", "err" => "batch_size");
+                    Err(err)?;
+                }
+    
+                let mut futures = Vec::with_capacity(batch_size);
+                let mut compute_chars = 0;
+    
+                for input in inputs {
+                    compute_chars += input.chars().count();
+    
+                    let local_infer = infer.clone();
+                    futures.push(async move {
+                        let permit = local_infer.acquire_permit().await;
+                        local_infer
+                            .embed(input, req.truncate, req.normalize, permit)
+                            .await
+                    })
+                }
+                let results = join_all(futures)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<InferResponse>, TextEmbeddingsError>>()
+                    .map_err(ErrorResponse::from)?;
+    
+                let mut embeddings = Vec::with_capacity(batch_size);
+                let mut total_tokenization_time = 0;
+                let mut total_queue_time = 0;
+                let mut total_inference_time = 0;
+                let mut total_compute_tokens = 0;
+    
+                for r in results {
+                    total_tokenization_time += r.tokenization.as_nanos() as u64;
+                    total_queue_time += r.queue.as_nanos() as u64;
+                    total_inference_time += r.inference.as_nanos() as u64;
+                    total_compute_tokens += r.prompt_tokens;
+                    embeddings.push(r.results);
+                }
+                let batch_size = batch_size as u64;
+    
+                metrics::increment_counter!("te_request_success", "method" => "batch");
+    
+                (
+                    EmbedResponse(embeddings),
+                    ResponseMetadata::new(
+                        compute_chars,
+                        total_compute_tokens,
+                        start_time,
+                        Duration::from_nanos(total_tokenization_time / batch_size),
+                        Duration::from_nanos(total_queue_time / batch_size),
+                        Duration::from_nanos(total_inference_time / batch_size),
+                    ),
+                )
+            }
+        };
+    
+        metadata.record_span(&span);
+        metadata.record_metrics();
+    
+        let headers = HeaderMap::from(metadata);
+    
+        tracing::info!("Success");
+    
+        Ok((headers, Json(response)))
+    }
+    
+/// Get Embeddings in weaviate format. Returns a 424 status code if the model is not an embedding model.
+#[utoipa::path(
 post,
 tag = "Text Embeddings Inference",
 path = "/vectors",
@@ -443,117 +600,32 @@ example = json ! ({"error": "Batch size error", "error_type": "validation"})),
     skip_all,
     fields(total_time, tokenization_time, queue_time, inference_time,)
 )]
-async fn embed(
+async fn weaviate_embed(
     infer: Extension<Infer>,
     info: Extension<Info>,
-    Json(req): Json<EmbedRequest>,
-) -> Result<(HeaderMap, Json<EmbedResponse>), (StatusCode, Json<ErrorResponse>)> {
+    Json(req): Json<EmbedWeaviateRequest>,
+) -> Result<(HeaderMap, Json<EmbedWeaviateResponse>), (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::Span::current();
     let start_time = Instant::now();
 
-    let (response, metadata) = match req.text {
-        Input::Single(text) => {
-            metrics::increment_counter!("te_request_count", "method" => "single");
+    let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
+    let response = infer
+        .embed(req.text.clone(), req.truncate, req.normalize, permit)
+        .await
+        .map_err(ErrorResponse::from)?;
 
-            let compute_chars = text.chars().count();
+    let vector = response.results; 
+    let dim = vector.len();
 
-            let permit = infer.try_acquire_permit().map_err(ErrorResponse::from)?;
-            let response = infer
-                .embed(text, req.truncate, req.normalize, permit)
-                .await
-                .map_err(ErrorResponse::from)?;
-
-            metrics::increment_counter!("te_request_success", "method" => "single");
-
-            (
-                EmbedResponse(vec![response.results]),
-                ResponseMetadata::new(
-                    compute_chars,
-                    response.prompt_tokens,
-                    start_time,
-                    response.tokenization,
-                    response.queue,
-                    response.inference,
-                ),
-            )
-        }
-        Input::Batch(text) => {
-            metrics::increment_counter!("te_request_count", "method" => "batch");
-
-            let batch_size = text.len();
-            if batch_size > info.max_client_batch_size {
-                let message = format!(
-                    "batch size {batch_size} > maximum allowed batch size {}",
-                    info.max_client_batch_size
-                );
-                tracing::error!("{message}");
-                let err = ErrorResponse {
-                    error: message,
-                    error_type: ErrorType::Validation,
-                };
-                metrics::increment_counter!("te_request_failure", "err" => "batch_size");
-                Err(err)?;
-            }
-
-            let mut futures = Vec::with_capacity(batch_size);
-            let mut compute_chars = 0;
-
-            for txt in text {
-                compute_chars += txt.chars().count();
-
-                let local_infer = infer.clone();
-                futures.push(async move {
-                    let permit = local_infer.acquire_permit().await;
-                    local_infer
-                        .embed(txt, req.truncate, req.normalize, permit)
-                        .await
-                })
-            }
-            let results = join_all(futures)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<InferResponse>, TextEmbeddingsError>>()
-                .map_err(ErrorResponse::from)?;
-
-            let mut embeddings = Vec::with_capacity(batch_size);
-            let mut total_tokenization_time = 0;
-            let mut total_queue_time = 0;
-            let mut total_inference_time = 0;
-            let mut total_compute_tokens = 0;
-
-            for r in results {
-                total_tokenization_time += r.tokenization.as_nanos() as u64;
-                total_queue_time += r.queue.as_nanos() as u64;
-                total_inference_time += r.inference.as_nanos() as u64;
-                total_compute_tokens += r.prompt_tokens;
-                embeddings.push(r.results);
-            }
-            let batch_size = batch_size as u64;
-
-            metrics::increment_counter!("te_request_success", "method" => "batch");
-
-            (
-                EmbedResponse(embeddings),
-                ResponseMetadata::new(
-                    compute_chars,
-                    total_compute_tokens,
-                    start_time,
-                    Duration::from_nanos(total_tokenization_time / batch_size),
-                    Duration::from_nanos(total_queue_time / batch_size),
-                    Duration::from_nanos(total_inference_time / batch_size),
-                ),
-            )
-        }
+    let json_response = EmbedWeaviateResponse {
+        text: req.text,
+        vector,
+        dim,
     };
 
-    metadata.record_span(&span);
-    metadata.record_metrics();
+    let headers = HeaderMap::new(); 
 
-    let headers = HeaderMap::from(metadata);
-
-    tracing::info!("Success");
-
-    Ok((headers, Json(response)))
+    Ok((headers, Json(json_response)))
 }
 
 /// OpenAI compatible route. Returns a 424 status code if the model is not an embedding model.
@@ -801,16 +873,19 @@ pub async fn run(
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", ApiDoc::openapi()))
         // Base routes
-        .route("/meta", get(get_model_info))
-        .route("/vectors", post(embed))
-        .route("/vectors/", post(embed)) 
+        .route("/embed", post(embed))
         .route("/predict", post(predict))
         .route("/rerank", post(rerank))
         // OpenAI compat route
         .route("/embeddings", post(openai_embed))
-        // Base Health route
+        // Weaviate compat route
+        .route("/vectors", post(weaviate_embed))
+        .route("/vectors/", post(weaviate_embed)) 
         .route("/.well-known/live", get(live))
         .route("/.well-known/ready", get(ready))
+        .route("/meta", get(get_model_info))
+        // Base Health route
+        .route("/health", get(health))
         // Inference API health route
         .route("/", get(health))
         // AWS Sagemaker health route
