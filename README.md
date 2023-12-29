@@ -2,6 +2,8 @@
 
 # Text Embeddings Inference (Weaviate compatible)
 
+**This fork adds the endpoints expected by Weaviate's t2v-transformers module.**
+
 <a href="https://github.com/huggingface/text-embeddings-inference">
   <img alt="GitHub Repo stars" src="https://img.shields.io/github/stars/huggingface/text-embeddings-inference?style=social">
 </a>
