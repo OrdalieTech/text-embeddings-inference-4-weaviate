@@ -315,7 +315,7 @@ fn default_normalize() -> bool {
 #[schema(example = json!([[0.0, 1.0, 2.0]]))]
 pub(crate) struct EmbedResponse(pub Vec<Vec<f32>>);
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, Debug)]
 pub(crate) struct EmbedWeaviateRequest {
     pub text: String,
     #[serde(default)]
@@ -326,7 +326,7 @@ pub(crate) struct EmbedWeaviateRequest {
     pub normalize: bool,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, ToSchema, Debug)]
 pub(crate) struct EmbedWeaviateResponse {
     pub text: String,
     pub vector: Vec<f32>,

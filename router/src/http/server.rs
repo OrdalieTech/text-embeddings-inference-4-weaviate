@@ -8,6 +8,8 @@ use crate::{
     shutdown, ClassifierModel, EmbeddingModel, ErrorResponse, ErrorType, Info, ModelType,
     ResponseMetadata,
 };
+use axum::{body::Bytes};
+use serde_json::from_slice;
 use anyhow::Context;
 use axum::extract::Extension;
 use axum::http::HeaderValue;
@@ -25,7 +27,9 @@ use text_embeddings_core::infer::{Infer, InferResponse};
 use text_embeddings_core::TextEmbeddingsError;
 use tokio::sync::OwnedSemaphorePermit;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::cors::any;
 use tracing::instrument;
+use tracing::{info, error};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -603,8 +607,21 @@ example = json ! ({"error": "Batch size error", "error_type": "validation"})),
 async fn weaviate_embed(
     infer: Extension<Infer>,
     info: Extension<Info>,
-    Json(req): Json<EmbedWeaviateRequest>,
+    body: Bytes,
 ) -> Result<(HeaderMap, Json<EmbedWeaviateResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let req = match from_slice::<EmbedWeaviateRequest>(&body) {
+        Ok(req) => req,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "Invalid request body".to_string(),
+                    error_type: ErrorType::Validation,
+                }),
+            ));
+        }
+    };
+
     let span = tracing::Span::current();
     let start_time = Instant::now();
 
@@ -612,7 +629,10 @@ async fn weaviate_embed(
     let response = infer
         .embed(req.text.clone(), req.truncate, req.normalize, permit)
         .await
-        .map_err(ErrorResponse::from)?;
+        .map_err(|e| {
+            error!("Error during embedding: {:?}", e);
+            ErrorResponse::from(e)
+        })?;
 
     let vector = response.results; 
     let dim = vector.len();
@@ -866,7 +886,7 @@ pub async fn run(
     let allow_origin = allow_origin.unwrap_or(AllowOrigin::any());
     let cors_layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST])
-        .allow_headers([http::header::CONTENT_TYPE])
+        .allow_headers(any())
         .allow_origin(allow_origin);
 
     // Create router
